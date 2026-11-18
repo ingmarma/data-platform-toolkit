@@ -1,0 +1,304 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Data Platform Toolkit — Serverless data quality, observability,
+  and self-service query infrastructure.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 300
+    MemorySize: 256
+    Architectures:
+      - arm64
+    Environment:
+      Variables:
+        LOG_LEVEL: INFO
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+  DataBucket:
+    Type: String
+    Description: S3 bucket for data lake files
+  ResultsBucket:
+    Type: String
+    Description: S3 bucket for Athena query results
+
+Resources:
+  # ============================================================
+  # Schema Validator
+  # ============================================================
+  SchemaValidatorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "dpt-schema-validator-${Environment}"
+      CodeUri: ../schema-validator/src/
+      Handler: handler.handler
+      Environment:
+        Variables:
+          QUARANTINE_BUCKET: !Sub "${DataBucket}-quarantine"
+          ALERT_TOPIC: !Ref AlertTopic
+      Events:
+        S3Upload:
+          Type: S3
+          Properties:
+            Bucket: !Ref DataBucketRef
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: raw/
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref DataBucket
+        - S3CrudPolicy:
+            BucketName: !Sub "${DataBucket}-quarantine"
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt AlertTopic.TopicName
+        - Statement:
+            - Effect: Allow
+              Action:
+                - glue:GetSchema
+                - glue:GetSchemaVersion
+              Resource: "*"
+
+  # ============================================================
+  # Quality Engine
+  # ============================================================
+  QualityEngineFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "dpt-quality-engine-${Environment}"
+      CodeUri: ../quality-engine/src/
+      Handler: handler.handler
+      Environment:
+        Variables:
+          DATASETS_TABLE: !Ref DatasetsTable
+          METRICS_TABLE: !Ref QualityMetricsTable
+          ALERT_TOPIC: !Ref AlertTopic
+      Events:
+        ScheduledCheck:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 hour)
+            Description: Hourly data quality checks
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DatasetsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref QualityMetricsTable
+        - S3ReadPolicy:
+            BucketName: !Ref DataBucket
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt AlertTopic.TopicName
+        - Statement:
+            - Effect: Allow
+              Action:
+                - athena:StartQueryExecution
+                - athena:GetQueryExecution
+                - athena:GetQueryResults
+              Resource: "*"
+
+  # ============================================================
+  # Pipeline Observability
+  # ============================================================
+  ObservabilityFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "dpt-observability-${Environment}"
+      CodeUri: ../pipeline-observability/src/
+      Handler: handler.handler
+      Environment:
+        Variables:
+          METRICS_TABLE: !Ref PipelineMetricsTable
+          CLOUDWATCH_NAMESPACE: !Sub "DataPlatform/${Environment}"
+      Events:
+        GlueEvents:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source:
+                - aws.glue
+              detail-type:
+                - Glue Job State Change
+        StepFunctionEvents:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source:
+                - aws.states
+              detail-type:
+                - Step Functions Execution Status Change
+        CustomEvents:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source:
+                - custom.pipeline
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PipelineMetricsTable
+        - CloudWatchPutMetricPolicy: {}
+
+  # ============================================================
+  # Self-Service Queries
+  # ============================================================
+  QueryApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "dpt-query-api-${Environment}"
+      CodeUri: ../self-service-queries/src/
+      Handler: handler.handler
+      Environment:
+        Variables:
+          TEMPLATES_TABLE: !Ref QueryTemplatesTable
+          USAGE_TABLE: !Ref QueryUsageTable
+          RESULTS_BUCKET: !Ref ResultsBucket
+          ATHENA_WORKGROUP: !Ref AthenaWorkgroup
+      Events:
+        PostQuery:
+          Type: Api
+          Properties:
+            Path: /query
+            Method: POST
+        GetResult:
+          Type: Api
+          Properties:
+            Path: /query/{id}
+            Method: GET
+        ListTemplates:
+          Type: Api
+          Properties:
+            Path: /queries
+            Method: GET
+        GetUsage:
+          Type: Api
+          Properties:
+            Path: /usage
+            Method: GET
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref QueryTemplatesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref QueryUsageTable
+        - S3CrudPolicy:
+            BucketName: !Ref ResultsBucket
+        - Statement:
+            - Effect: Allow
+              Action:
+                - athena:StartQueryExecution
+                - athena:GetQueryExecution
+                - athena:GetQueryResults
+              Resource: "*"
+
+  # ============================================================
+  # DynamoDB Tables
+  # ============================================================
+  DatasetsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "dpt-datasets-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: name
+          AttributeType: S
+      KeySchema:
+        - AttributeName: name
+          KeyType: HASH
+
+  QualityMetricsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "dpt-quality-metrics-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: dataset_name
+          AttributeType: S
+        - AttributeName: metric_date
+          AttributeType: S
+      KeySchema:
+        - AttributeName: dataset_name
+          KeyType: HASH
+        - AttributeName: metric_date
+          KeyType: RANGE
+
+  PipelineMetricsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "dpt-pipeline-metrics-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pipeline_name
+          AttributeType: S
+        - AttributeName: run_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pipeline_name
+          KeyType: HASH
+        - AttributeName: run_id
+          KeyType: RANGE
+
+  QueryTemplatesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "dpt-query-templates-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: name
+          AttributeType: S
+      KeySchema:
+        - AttributeName: name
+          KeyType: HASH
+
+  QueryUsageTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "dpt-query-usage-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: user
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+
+  # ============================================================
+  # Shared Resources
+  # ============================================================
+  DataBucketRef:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref DataBucket
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "dpt-alerts-${Environment}"
+
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "dpt-self-service-${Environment}"
+      WorkGroupConfiguration:
+        BytesScannedCutoffPerQuery: 10737418240  # 10 GB
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${ResultsBucket}/athena-results/"
+
+Outputs:
+  ApiUrl:
+    Description: Self-Service Query API URL
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod"
+  AlertTopicArn:
+    Description: SNS topic for alerts
+    Value: !Ref AlertTopic
+  ObservabilityNamespace:
+    Description: CloudWatch namespace for pipeline metrics
+    Value: !Sub "DataPlatform/${Environment}"
