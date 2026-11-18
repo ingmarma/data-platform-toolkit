@@ -21,28 +21,28 @@ This toolkit gives you production-ready modules for the four pillars of a mature
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│                     DATA SOURCES                              │
+│                     DATA SOURCES                             │
 │       APIs  ·  Databases  ·  S3 Uploads  ·  Streams          │
 └──────────────────────┬───────────────────────────────────────┘
                        │
           ┌────────────▼────────────┐
           │    SCHEMA VALIDATOR     │  ← Catch breaking changes
-          │  Glue Registry + S3    │     before they propagate
+          │  Glue Registry + S3     │     before they propagate
           └────────────┬────────────┘
                        │
           ┌────────────▼────────────┐
           │    QUALITY ENGINE       │  ← Freshness SLAs, volume
-          │  Athena + DynamoDB     │     anomalies, null rates
+          │  Athena + DynamoDB      │     anomalies, null rates
           └────────────┬────────────┘
                        │
           ┌────────────▼────────────┐
           │  PIPELINE OBSERVABILITY │  ← Duration, cost, records
-          │  EventBridge + CW      │     per pipeline per run
+          │  EventBridge + CW       │     per pipeline per run
           └────────────┬────────────┘
                        │
           ┌────────────▼────────────┐
           │  SELF-SERVICE QUERIES   │  ← Parameterized SQL API
-          │  API GW + Athena       │     with usage analytics
+          │  API GW + Athena        │     with usage analytics
           └─────────────────────────┘
 ```
 
